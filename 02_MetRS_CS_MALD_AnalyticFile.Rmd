@@ -1,0 +1,614 @@
+---
+title: "MALD_metRS_CS"
+author: "Suneeta Godbole"
+date: "2/4/2022"
+output: pdf_document
+---
+
+```{r setup}
+rm(list=ls())
+library(glmnet)
+
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(gridtext)
+
+datafiles <- "C:/NetCo/Metabolomic_Risk_Score/metRS_CS_AnalyticFiles"
+spiro.metInfo.folder <- "C:/NetCo/Metabolomics/NewMetabolonDatasets_20211018/processed"
+
+## Data Read-In
+spiro.c <- readRDS(file.path(datafiles, "SPIROMICS_MetRS_CS_Clinical.rds"))
+met_all <- readRDS(file.path(datafiles, "SPIROMICS_MetRS_CS_Metabolites.rds"))
+var.key <- readRDS(file.path(spiro.metInfo.folder, "SPIROMICS_V1_MetaboliteInformation_20211021.rds"))
+
+copd.clin.p2 <- readRDS(file.path(datafiles, "COPDGene_P2_MetRS_CS_Clinical.rds"))
+metRS_copd <- readRDS(file.path(datafiles, "COPDGene_P2_MetRS_CS_Metabolites.rds"))
+
+## Data outfile
+metRSfolder <- "C:/NetCo/Metabolomic_Risk_Score/metRS_output"
+
+## Function to caluculate MSE  
+fxn.mse <- function(x, y){
+  mse <- mean((x-y)^2)
+  return(mse)
+}
+
+```
+
+# MESA-adjusted Lung Density
+
+## Data prep
+```{r mald_dataprep}
+# SPIROMICS -- data prep
+met_all$SUBJID <- rownames(met_all)
+spiro.mald <- merge(spiro.c[, c("SUBJID", "adj_perc15")], 
+                       met_all, by = "SUBJID")
+
+spiro.mald <- spiro.mald[!(is.na(spiro.mald$adj_perc15)), ] # Remove subj with missing mald
+
+rownames(spiro.mald) <- spiro.mald$SUBJID
+spiro.mald$SUBJID <- NULL
+
+# COPDGene -- data prep
+metRS_copd$sid <- rownames(metRS_copd)
+
+copdg.mald <- merge(copd.clin.p2[, c("sid", "adj_density_mesa")], 
+                       metRS_copd, by = "sid")
+copdg.mald <- copdg.mald[!(is.na(copdg.mald$adj_density_mesa)), ]
+
+rownames(copdg.mald) <- copdg.mald$sid
+copdg.mald$sid <-  NULL
+```
+
+## mald Adaptive LASSO Results Tables
+```{r mald_adaLASSO}
+mald.adaLASSO.tS <- data.frame("study" = c("SPIROMICS", "COPDGene"), 
+                            stringsAsFactors = F)
+
+mald.adaLASSO.tC <- data.frame("study" = c("SPIROMICS", "COPDGene"), 
+                            stringsAsFactors = F)
+mald.adaLASSO.tSwt <- data.frame("study" = c("SPIROMICS", "COPDGene"), 
+                            stringsAsFactors = F)
+```
+
+## Adjust R-squared value for covariate only models
+```{r covarOnly}
+spiro.covar <- lm(adj_perc15 ~ GENDER + AGE_DERV_V1 + RACE.ETH + 
+                      BMI_CM_V1 + smokStatus + SMOKING_PACK_YEARS_V1 + SITE_cat + MODEL_V1_cat,
+                      data = spiro.c)
+spiro.covarOnly <- round(summary(spiro.covar)$adj.r.squared*100, 3) #35.391
+
+copdg.covar <- lm(adj_density_mesa ~ gender + age_visit + race.eth + 
+                    BMI + smoking_status + ATS_PackYears + ccenter + scannerId, 
+                    data = copd.clin.p2)
+copdg.covarOnly <- round(summary(copdg.covar)$adj.r.squared*100, 3) #40.213
+
+mald.adaLASSO.tS$Cov_Only_R2 <- c(spiro.covarOnly, copdg.covarOnly)
+mald.adaLASSO.tS$Cov_Only_MSE <- c(fxn.mse(spiro.covar$model$adj_perc15, fitted(spiro.covar)), 
+                                fxn.mse(copdg.covar$model$adj_density_mesa, fitted(copdg.covar)))
+
+mald.adaLASSO.tC$Cov_Only_R2 <- c(spiro.covarOnly, copdg.covarOnly)
+mald.adaLASSO.tC$Cov_Only_MSE <- c(fxn.mse(spiro.covar$model$adj_perc15, fitted(spiro.covar)), 
+                                fxn.mse(copdg.covar$model$adj_density_mesa, fitted(copdg.covar)))
+
+mald.adaLASSO.tSwt$Cov_Only_R2 <- c(spiro.covarOnly, copdg.covarOnly)
+mald.adaLASSO.tSwt$Cov_Only_MSE <- c(fxn.mse(spiro.covar$model$adj_perc15, fitted(spiro.covar)), 
+                                fxn.mse(copdg.covar$model$adj_density_mesa, fitted(copdg.covar)))
+``` 
+
+## ADAPTIVE LASSO -- Train SPIROMICS
+```{r adalasso_spiro}
+set.seed(20210820)
+
+# train: SPRIOMICS
+ridge.glmnet <- cv.glmnet(x = as.matrix(spiro.mald[, -1]),
+                          y = spiro.mald$adj_perc15,
+                          type.measure = "mse",
+                          alpha = 0)
+ridge.glmnet$lambda.min
+
+best_ridge_coef <- as.numeric(coef(ridge.glmnet, s = ridge.glmnet$lambda.min))[-1]
+
+adalasso.spiro.cv <- cv.glmnet(x = as.matrix(spiro.mald[, -1]),
+                          y = spiro.mald$adj_perc15,
+                          type.measure = "mse",
+                          alpha = 1, 
+                          penalty.factor = 1/abs(best_ridge_coef))
+
+plot(adalasso.spiro.cv)
+
+best_adalasso_spiro_coef <- coef(adalasso.spiro.cv, s = adalasso.spiro.cv$lambda.min, exact=TRUE)
+```
+
+## Table 2 & S1: All Metabolites selected by Adaptive LASSO
+```{r trainSpiro_metabs}
+#Capture Metabs used in mald Adaptive LASSO
+alasso_est <- best_adalasso_spiro_coef[, "s1"][-1]
+
+mald.adalasso.metab <- best_adalasso_spiro_coef[, "s1"][best_adalasso_spiro_coef[, "s1"] != 0]
+mald.adalasso.metab <- mald.adalasso.metab[-1]
+
+mald.metabs <- as.data.frame(cbind(names(mald.adalasso.metab), mald.adalasso.metab))
+names(mald.metabs) <- c("metab_id", "ALASSO_mald_Metabs")
+mald.metabs <- merge(mald.metabs, var.key, by = "metab_id", all.x = T)
+# write.csv(mald.metabs, file = file.path(metRSfolder, "mald_ALASSO_Metabolites_trainSPIRO.csv"),
+#           row.names = F)
+```
+
+```{r trainSpiro_regr}
+### SPIROMICS linear Models
+adalasso.spiro.pred <- predict(adalasso.spiro.cv, as.matrix(spiro.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+adalasso.spiro.pred <- as.data.frame(adalasso.spiro.pred)
+names(adalasso.spiro.pred) <- "adalasso_pred"
+adalasso.spiro.pred$SUBJID <- rownames(adalasso.spiro.pred)
+
+spiro.c$adalasso_pred <- NULL
+adalasso.spiro.pred <- merge(spiro.c, adalasso.spiro.pred, by = "SUBJID")
+
+spiro.adalasso <- lm(adj_perc15 ~ adalasso_pred, data = adalasso.spiro.pred)
+spiro.adalasso.r2 <- round(summary(spiro.adalasso)$adj.r.squared*100, 3) 
+spiro.adalasso.mse <- fxn.mse(spiro.adalasso$model$adj_perc15, fitted(spiro.adalasso))
+
+
+spiro.adalasso.adj <- lm(adj_perc15 ~ adalasso_pred + GENDER + AGE_DERV_V1 + 
+                      RACE.ETH+ BMI_CM_V1 + smokStatus + SMOKING_PACK_YEARS_V1 + SITE_cat + MODEL_V1_cat,
+                      data = adalasso.spiro.pred)
+
+spiro.adalasso.adj.r2 <- round(summary(spiro.adalasso.adj)$adj.r.squared*100, 3) 
+spiro.adalasso.adj.mse <- fxn.mse(spiro.adalasso.adj$model$adj_perc15, fitted(spiro.adalasso.adj))
+
+### COPDGene Linear Models
+adalasso.copdg.pred <- predict(adalasso.spiro.cv, as.matrix(copdg.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+
+adalasso.copdg.pred <- as.data.frame(adalasso.copdg.pred)
+names(adalasso.copdg.pred) <- "adalasso_pred"
+adalasso.copdg.pred$sid <- rownames(adalasso.copdg.pred)
+
+copd <- merge(copd.clin.p2, adalasso.copdg.pred, by = "sid")
+
+adalasso.copdg <- lm(adj_density_mesa ~ adalasso_pred, data = copd)
+copdg.adalasso.r2 <-round(summary(adalasso.copdg)$adj.r.squared*100, 3) 
+copdg.adalasso.mse <- fxn.mse(adalasso.copdg$model$adj_density_mesa, fitted(adalasso.copdg))
+
+
+adalasso.copdg.adj <- lm(adj_density_mesa ~ adalasso_pred + gender + age_visit + race.eth +
+                           BMI + smoking_status + ATS_PackYears + ccenter + scannerId, 
+                    data = copd)
+
+copdg.adalasso.adj.r2 <- round(summary(adalasso.copdg.adj)$adj.r.squared*100, 3)
+copdg.adalasso.adj.mse <-fxn.mse(adalasso.copdg.adj$model$adj_density_mesa, fitted(adalasso.copdg.adj)) 
+
+mald.adaLASSO.tS$metRS_Only_R2 <- c(spiro.adalasso.r2, copdg.adalasso.r2)
+mald.adaLASSO.tS$metRS_Only_MSE <- c(spiro.adalasso.mse, copdg.adalasso.mse)
+
+mald.adaLASSO.tS$Cov_metRS_R2 <- c(spiro.adalasso.adj.r2, copdg.adalasso.adj.r2)
+mald.adaLASSO.tS$Cov_metRS_MSE <- c(spiro.adalasso.adj.mse, copdg.adalasso.adj.mse)
+
+mald.adaLASSO.tS$met_num <- nrow(mald.metabs)
+
+mald.adaLASSO.tS <- mald.adaLASSO.tS[, c("study", "met_num", 
+                                   "Cov_Only_R2", "metRS_Only_R2", "Cov_metRS_R2",
+                                   "Cov_Only_MSE", "metRS_Only_MSE", "Cov_metRS_MSE")]
+
+# write.csv(mald.adaLASSO.tS, file.path(metRSfolder, "mald_adaLASSO_trainSpiro.csv"),
+#           row.names = F)
+```
+
+```{r alasso_plots}
+# jpeg(filename = file.path(metRSfolder, "SPIROMICS_mald_predvsobs_regLine.jpg"),
+#      height = 5, width = 5, units = "in", res = 300)
+plot(adalasso.spiro.pred$adalasso_pred, adalasso.spiro.pred$adj_perc15,
+     xlim = c(min(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T), 
+              max(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T)), 
+     ylim = c(min(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T), 
+              max(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T)),
+     xlab = "Predicted MESA-Adj Lung Density -- Adaptive LASSO", 
+     ylab = "Observed MESA-Adj Lung Density", 
+     pch = 16, cex = 0.5)
+####Color points by self-reported smoking status
+points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Current Smoker"],
+       adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Current Smoker"],
+       col = "pink", pch = 16)
+points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Former Smoker"],
+       adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Former Smoker"],
+       col = "violet", pch = 16)
+points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Never Smoked"],
+       adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Never Smoked"],
+       col = "lightblue", pch = 16)
+abline(0,1, col = "blue")
+abline(lm(adj_perc15 ~ adalasso_pred, data = adalasso.spiro.pred), col="darkorange")
+# dev.off()
+
+# plot(adalasso.spiro.pred$adj_perc15, adalasso.spiro.pred$adj_perc15 - adalasso.spiro.pred$adalasso_pred,
+#      xlab = "Observed MESA-Adj Lung Density", 
+#      ylab = "Difference Obs - Predicted")
+# abline(0,0, col = "blue")
+
+
+## COPDGene plots
+
+# jpeg(filename = file.path(metRSfolder, "COPDGene_mald_predvsobs_regLine.jpg"),
+#      height = 5, width = 5, units = "in", res = 300)
+plot(copd$adalasso_pred, copd$adj_density_mesa,
+     xlim = c(min(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T), 
+              max(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T)), 
+     ylim = c(min(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T), 
+              max(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T)),
+     xlab = "Predicted MESA-Adj Lung Density -- Adaptive LASSO", 
+     ylab = "Observed MESA-Adj Lung Density", 
+     pch = 16, cex = 0.5)
+####Color points by self-reported smoking status
+points(copd$adalasso_pred[copd$smoking_status == "Former Smoker"],
+       copd$adj_density_mesa[copd$smoking_status == "Former Smoker"],
+       col = "violet", pch = 16)
+points(copd$adalasso_pred[copd$smoking_status == "Current Smoker"],
+       copd$adj_density_mesa[copd$smoking_status == "Current Smoker"],
+       col = "pink", pch = 16)
+points(copd$adalasso_pred[copd$smoking_status == "Never Smoked"],
+       copd$adj_density_mesa[copd$smoking_status == "Never Smoked"],
+       col = "lightblue", pch = 16)
+abline(0,1, col = "blue")
+abline(lm(adj_density_mesa ~ adalasso_pred, data = copd), col="darkorange")
+
+# dev.off()
+
+plot(copd$adj_density_mesa, copd$adj_density_mesa - copd$adalasso_pred,
+     xlab = "Observed MESA-Adj Lung Density", 
+     ylab = "Difference Obs - Predicted")
+abline(0,0, col = "blue")
+```
+
+## Sensitivity Analysis -- 
+### Train on COPDGene, Validation on SPIROMICS
+```{r train_copdg}
+set.seed(20210820)
+# train: COPDGene
+ridge.glmnet <- cv.glmnet(x = as.matrix(copdg.mald[, -1]),
+                          y = copdg.mald$adj_density_mesa,
+                          type.measure = "mse",
+                          alpha = 0)
+ridge.glmnet$lambda.min
+
+best_ridge_coef <- as.numeric(coef(ridge.glmnet, s = ridge.glmnet$lambda.min))[-1]
+
+adalasso.spiro <- glmnet(x = as.matrix(copdg.mald[, -1]),
+                         y = copdg.mald$adj_density_mesa,
+                         alpha = 1,
+                         penalty.factor = 1/abs(best_ridge_coef))
+
+adalasso.spiro.cv <- cv.glmnet(x = as.matrix(copdg.mald[, -1]),
+                          y = copdg.mald$adj_density_mesa,
+                          type.measure = "mse",
+                          alpha = 1,
+                          penalty.factor = 1/abs(best_ridge_coef))
+
+plot(adalasso.spiro.cv)
+
+best_adalasso_spiro_coef <- coef(adalasso.spiro.cv, s = adalasso.spiro.cv$lambda.min)
+```
+
+```{r trainCopdg_metabs}
+#Capture Metabs used in mald Adaptive LASSO
+alasso_est <- best_adalasso_spiro_coef[, "s1"][-1]
+
+mald.adalasso.metab <- best_adalasso_spiro_coef[, "s1"][best_adalasso_spiro_coef[, "s1"] != 0]
+mald.adalasso.metab <- mald.adalasso.metab[-1]
+
+mald.metabs <- as.data.frame(cbind(names(mald.adalasso.metab), mald.adalasso.metab))
+names(mald.metabs) <- c("metab_id", "ALASSO_mald_Metabs")
+mald.metabs <- merge(mald.metabs, var.key, by = "metab_id", all.x = T)
+# write.csv(mald.metabs, file = file.path(metRSfolder, "mald_ALASSO_Metabolites_trainCOPDGene.csv"),
+#           row.names = F)
+```
+
+```{r trainCopdg_regr}
+### SPIROMICS linear Models
+adalasso.spiro.pred <- predict(adalasso.spiro.cv, as.matrix(spiro.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+adalasso.spiro.pred <- as.data.frame(adalasso.spiro.pred)
+names(adalasso.spiro.pred) <- "adalasso_pred"
+adalasso.spiro.pred$SUBJID <- rownames(adalasso.spiro.pred)
+
+spiro.c$adalasso_pred <- NULL
+adalasso.spiro.pred <- merge(spiro.c, adalasso.spiro.pred, by = "SUBJID")
+
+spiro.adalasso <- lm(adj_perc15 ~ adalasso_pred, data = adalasso.spiro.pred)
+spiro.adalasso.r2 <- round(summary(spiro.adalasso)$adj.r.squared*100, 3) 
+spiro.adalasso.mse <- fxn.mse(spiro.adalasso$model$adj_perc15, fitted(spiro.adalasso))
+
+
+spiro.adalasso.adj <- lm(adj_perc15 ~ adalasso_pred + GENDER + AGE_DERV_V1 + 
+                      RACE.ETH+ BMI_CM_V1 + smokStatus + SMOKING_PACK_YEARS_V1 + SITE_cat + MODEL_V1_cat,
+                      data = adalasso.spiro.pred)
+
+spiro.adalasso.adj.r2 <- round(summary(spiro.adalasso.adj)$adj.r.squared*100, 3) 
+spiro.adalasso.adj.mse <- fxn.mse(spiro.adalasso.adj$model$adj_perc15, fitted(spiro.adalasso.adj))
+
+### COPDGene Linear Models
+adalasso.copdg.pred <- predict(adalasso.spiro.cv, as.matrix(copdg.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+
+adalasso.copdg.pred <- as.data.frame(adalasso.copdg.pred)
+names(adalasso.copdg.pred) <- "adalasso_pred"
+adalasso.copdg.pred$sid <- rownames(adalasso.copdg.pred)
+
+copd <- merge(copd.clin.p2, adalasso.copdg.pred, by = "sid")
+
+adalasso.copdg <- lm(adj_density_mesa ~ adalasso_pred, data = copd)
+copdg.adalasso.r2 <-round(summary(adalasso.copdg)$adj.r.squared*100, 3) 
+copdg.adalasso.mse <- fxn.mse(adalasso.copdg$model$adj_density_mesa, fitted(adalasso.copdg))
+
+
+adalasso.copdg.adj <- lm(adj_density_mesa ~ adalasso_pred + gender + age_visit + race.eth +
+                           BMI + smoking_status + ATS_PackYears + ccenter + scannerId, 
+                    data = copd)
+
+copdg.adalasso.adj.r2 <- round(summary(adalasso.copdg.adj)$adj.r.squared*100, 3)
+copdg.adalasso.adj.mse <-fxn.mse(adalasso.copdg.adj$model$adj_density_mesa, fitted(adalasso.copdg.adj)) 
+
+mald.adaLASSO.tC$metRS_Only_R2 <- c(spiro.adalasso.r2, copdg.adalasso.r2)
+mald.adaLASSO.tC$metRS_Only_MSE <- c(spiro.adalasso.mse, copdg.adalasso.mse)
+
+mald.adaLASSO.tC$Cov_metRS_R2 <- c(spiro.adalasso.adj.r2, copdg.adalasso.adj.r2)
+mald.adaLASSO.tC$Cov_metRS_MSE <- c(spiro.adalasso.adj.mse, copdg.adalasso.adj.mse)
+
+mald.adaLASSO.tC$met_num <- nrow(mald.metabs)
+
+mald.adaLASSO.tC <- mald.adaLASSO.tC[, c("study", "met_num", 
+                                   "Cov_Only_R2", "metRS_Only_R2", "Cov_metRS_R2",
+                                   "Cov_Only_MSE", "metRS_Only_MSE", "Cov_metRS_MSE")]
+
+# write.csv(mald.adaLASSO.tC, file.path(metRSfolder, "mald_adaLASSO_trainCOPDGene.csv"),
+#           row.names = F)
+```
+
+```{r trainCopdg_alasso_plots}
+# jpeg(filename = file.path(metRSfolder, "SPIROMICS_mald_predvsobs_regLine.jpg"),
+#      height = 5, width = 5, units = "in", res = 300)
+plot(adalasso.spiro.pred$adalasso_pred, adalasso.spiro.pred$adj_perc15,
+     xlim = c(min(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T), 
+              max(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T)), 
+     ylim = c(min(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T), 
+              max(adalasso.spiro.pred$adj_perc15, 
+                  adalasso.spiro.pred$adalasso_pred, na.rm = T)),
+     xlab = "Predicted mald -- Adaptive LASSO", 
+     ylab = "Observed mald", 
+     pch = 16, cex = 0.5)
+# ####Color points by self-reported smoking status
+# points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Current Smoker"], 
+#        adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Current Smoker"], 
+#        col = "pink", pch = 16)
+# points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Former Smoker"], 
+#        adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Former Smoker"], 
+#        col = "violet", pch = 16)
+# points(adalasso.spiro.pred$adalasso_pred[adalasso.spiro.pred$smokStatus == "Never Smoked"], 
+#        adalasso.spiro.pred$adj_perc15[adalasso.spiro.pred$smokStatus == "Never Smoked"], 
+#        col = "lightblue", pch = 16)
+abline(0,1, col = "blue")
+abline(lm(adj_perc15 ~ adalasso_pred, data = adalasso.spiro.pred), col="darkorange")
+# dev.off()
+
+plot(adalasso.spiro.pred$adj_perc15, adalasso.spiro.pred$adj_perc15 - adalasso.spiro.pred$adalasso_pred,
+     xlab = "Observed mald", 
+     ylab = "Difference Obs - Predicted")
+abline(0,0, col = "blue")
+
+
+## COPDGene plots
+
+# jpeg(filename = file.path(metRSfolder, "COPDGene_mald_predvsobs_regLine.jpg"),
+#      height = 5, width = 5, units = "in", res = 300)
+plot(copd$adalasso_pred, copd$adj_density_mesa,
+     xlim = c(min(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T), 
+              max(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T)), 
+     ylim = c(min(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T), 
+              max(copd$adj_density_mesa, copd$adalasso_pred, na.rm = T)),
+     xlab = "Predicted mald -- Adaptive LASSO", 
+     ylab = "Observed mald", 
+     pch = 16, cex = 0.5)
+# ####Color points by self-reported smoking status
+# points(copd$adalasso_pred[copd$smoking_status == "Former Smoker"],
+#        copd$adj_density_mesa[copd$smoking_status == "Former Smoker"],
+#        col = "violet", pch = 16)
+# points(copd$adalasso_pred[copd$smoking_status == "Current Smoker"],
+#        copd$adj_density_mesa[copd$smoking_status == "Current Smoker"],
+#        col = "pink", pch = 16)
+# points(copd$adalasso_pred[copd$smoking_status == "Never Smoked"],
+#        copd$adj_density_mesa[copd$smoking_status == "Never Smoked"],
+#        col = "lightblue", pch = 16)
+abline(0,1, col = "blue")
+abline(lm(adj_density_mesa ~ adalasso_pred, data = copd), col="darkorange")
+
+# dev.off()
+
+plot(copd$adj_density_mesa, copd$adj_density_mesa - copd$adalasso_pred,
+     xlab = "Observed mald", 
+     ylab = "Difference Obs - Predicted")
+abline(0,0, col = "blue")
+```
+
+### Train SPIROMICS with weights on highest and lowest quintile
+```{r adalasso_spiroWT}
+quan.mald <- quantile(spiro.mald$adj_perc15, probs = c(0.2, 0.8))
+wt <- ifelse(spiro.mald$adj_perc15 < quan.mald[1] | 
+               spiro.mald$adj_perc15 > quan.mald[2], 
+             5, 1)
+
+
+set.seed(20210820)
+
+# train: SPRIOMICS
+ridge.glmnet <- cv.glmnet(x = as.matrix(spiro.mald[, -1]),
+                          y = spiro.mald$adj_perc15,
+                          type.measure = "mse",
+                          alpha = 0, 
+                          weights = wt)
+ridge.glmnet$lambda.min
+
+best_ridge_coef <- as.numeric(coef(ridge.glmnet, s = ridge.glmnet$lambda.min))[-1]
+
+adalasso.spiro.cv <- cv.glmnet(x = as.matrix(spiro.mald[, -1]),
+                          y = spiro.mald$adj_perc15,
+                          type.measure = "mse",
+                          alpha = 1, 
+                          penalty.factor = 1/abs(best_ridge_coef), 
+                          weights = wt)
+
+plot(adalasso.spiro.cv)
+
+best_adalasso_spiro_coef <- coef(adalasso.spiro.cv, s = adalasso.spiro.cv$lambda.min, exact=TRUE)
+```
+
+```{r trainSpiroWT_metabs}
+#Capture Metabs used in mald Adaptive LASSO
+alasso_est <- best_adalasso_spiro_coef[, "s1"][-1]
+
+mald.adalasso.metab <- best_adalasso_spiro_coef[, "s1"][best_adalasso_spiro_coef[, "s1"] != 0]
+mald.adalasso.metab <- mald.adalasso.metab[-1]
+
+mald.metabs <- as.data.frame(cbind(names(mald.adalasso.metab), mald.adalasso.metab))
+names(mald.metabs) <- c("metab_id", "ALASSO_mald_Metabs")
+mald.metabs <- merge(mald.metabs, var.key, by = "metab_id", all.x = T)
+# write.csv(mald.metabs, file = file.path(metRSfolder, "mald_ALASSO_Metabolites_trainSPIRO_Weighted.csv"),
+#           row.names = F)
+```
+
+```{r trainSpiroWT_regr}
+### SPIROMICS linear Models
+adalasso.spiro.pred <- predict(adalasso.spiro.cv, as.matrix(spiro.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+adalasso.spiro.pred <- as.data.frame(adalasso.spiro.pred)
+names(adalasso.spiro.pred) <- "adalasso_pred"
+adalasso.spiro.pred$SUBJID <- rownames(adalasso.spiro.pred)
+
+spiro.c$adalasso_pred <- NULL
+adalasso.spiro.pred <- merge(spiro.c, adalasso.spiro.pred, by = "SUBJID")
+
+spiro.adalasso <- lm(adj_perc15 ~ adalasso_pred, data = adalasso.spiro.pred)
+spiro.adalasso.r2 <- round(summary(spiro.adalasso)$adj.r.squared*100, 3) 
+spiro.adalasso.mse <- fxn.mse(spiro.adalasso$model$adj_perc15, fitted(spiro.adalasso))
+
+
+spiro.adalasso.adj <- lm(adj_perc15 ~ adalasso_pred + GENDER + AGE_DERV_V1 + 
+                      RACE.ETH+ BMI_CM_V1 + smokStatus + SMOKING_PACK_YEARS_V1 + SITE_cat + MODEL_V1_cat,
+                      data = adalasso.spiro.pred)
+
+spiro.adalasso.adj.r2 <- round(summary(spiro.adalasso.adj)$adj.r.squared*100, 3) 
+spiro.adalasso.adj.mse <- fxn.mse(spiro.adalasso.adj$model$adj_perc15, fitted(spiro.adalasso.adj))
+
+### COPDGene Linear Models
+adalasso.copdg.pred <- predict(adalasso.spiro.cv, as.matrix(copdg.mald[, -1]), 
+                               s = adalasso.spiro.cv$lambda.min)
+
+adalasso.copdg.pred <- as.data.frame(adalasso.copdg.pred)
+names(adalasso.copdg.pred) <- "adalasso_pred"
+adalasso.copdg.pred$sid <- rownames(adalasso.copdg.pred)
+
+copd <- merge(copd.clin.p2, adalasso.copdg.pred, by = "sid")
+
+adalasso.copdg <- lm(adj_density_mesa ~ adalasso_pred, data = copd)
+copdg.adalasso.r2 <-round(summary(adalasso.copdg)$adj.r.squared*100, 3) 
+copdg.adalasso.mse <- fxn.mse(adalasso.copdg$model$adj_density_mesa, fitted(adalasso.copdg))
+
+
+adalasso.copdg.adj <- lm(adj_density_mesa ~ adalasso_pred + gender + age_visit + race.eth +
+                           BMI + smoking_status + ATS_PackYears + ccenter + scannerId, 
+                    data = copd)
+
+copdg.adalasso.adj.r2 <- round(summary(adalasso.copdg.adj)$adj.r.squared*100, 3)
+copdg.adalasso.adj.mse <-fxn.mse(adalasso.copdg.adj$model$adj_density_mesa, fitted(adalasso.copdg.adj)) 
+
+mald.adaLASSO.tSwt$metRS_Only_R2 <- c(spiro.adalasso.r2, copdg.adalasso.r2)
+mald.adaLASSO.tSwt$metRS_Only_MSE <- c(spiro.adalasso.mse, copdg.adalasso.mse)
+
+mald.adaLASSO.tSwt$Cov_metRS_R2 <- c(spiro.adalasso.adj.r2, copdg.adalasso.adj.r2)
+mald.adaLASSO.tSwt$Cov_metRS_MSE <- c(spiro.adalasso.adj.mse, copdg.adalasso.adj.mse)
+
+mald.adaLASSO.tSwt$met_num <- nrow(mald.metabs)
+
+mald.adaLASSO.tSwt <- mald.adaLASSO.tSwt[, c("study", "met_num", 
+                                   "Cov_Only_R2", "metRS_Only_R2", "Cov_metRS_R2",
+                                   "Cov_Only_MSE", "metRS_Only_MSE", "Cov_metRS_MSE")]
+
+# write.csv(mald.adaLASSO.tSwt, file.path(metRSfolder, "mald_adaLASSO_trainSpiroWeighted.csv"),
+#            row.names = F)
+```
+
+## Scatterplot of top 4 metabolites and mald
+```{r scatter_topMetab}
+
+mald.metabs <- read.csv(file.path(metRSfolder, "mald_ALASSO_Metabolites_trainSPIRO.csv"), 
+                        header = T, stringsAsFactors = F)
+mald.metabs <- mald.metabs[order(abs(as.numeric(mald.metabs$ALASSO_mald_Metabs)), decreasing = T), ]
+
+top.metab <- head(mald.metabs$metab_id, n = 4)
+
+spiro.plots <- vector(mode="list", length =4)
+copdg.plots <- vector(mode="list", length =4) 
+
+for(i in seq_along(top.metab)){
+  message(i)
+  min.val <- min(spiro.mald[top.metab[i]], copdg.mald[, top.metab[i]])
+  max.val <- max(spiro.mald[top.metab[i]], copdg.mald[, top.metab[i]])
+  spiro.plots[[i]] <-  local({
+    i <- i
+    p1 <- ggplot(data = spiro.mald, 
+                              aes(x = spiro.mald[, top.metab[i]], 
+                                  y = adj_perc15))+
+    geom_point()+
+    xlim(min.val, max.val)+
+    theme_bw()+
+    theme(axis.title.x = element_blank(), 
+          axis.title.y = element_blank())
+    print(p1)
+  })
+    
+
+  copdg.plots[[i]] <- local({
+    i <- i
+    p1 <- ggplot(data = copdg.mald, 
+                             aes(copdg.mald[, top.metab[i]], 
+                                 adj_density_mesa))+
+      geom_point()+
+      xlim(min.val, max.val)+
+      theme_bw()+
+      theme(axis.title.x = element_blank(), 
+            axis.title.y = element_blank())
+  })
+    
+}
+
+
+ylab = textGrob("MESA-adjusted Lung Density", rot = 90)
+xlab1 = textGrob(mald.metabs[mald.metabs$metab_id == top.metab[1], "CHEMICAL_NAME"])
+xlab2 = textGrob(mald.metabs[mald.metabs$metab_id == top.metab[2], "CHEMICAL_NAME"])
+xlab3 = textGrob(mald.metabs[mald.metabs$metab_id == top.metab[3], "CHEMICAL_NAME"])
+xlab4 = textGrob(mald.metabs[mald.metabs$metab_id == top.metab[4], "CHEMICAL_NAME"])
+
+g1 <- grid.arrange(arrangeGrob(spiro.plots[[1]], top = textGrob("SPIROMICS")), 
+                   arrangeGrob(copdg.plots[[1]], top = textGrob("COPDGene")), 
+                  bottom = xlab1, ncol = 2)
+g2 <- grid.arrange(spiro.plots[[2]], copdg.plots[[2]], 
+                  bottom = xlab2, ncol = 2)
+g3 <- grid.arrange(spiro.plots[[3]], copdg.plots[[3]], 
+                  bottom = xlab3, ncol = 2)
+g4 <- grid.arrange(spiro.plots[[4]], copdg.plots[[4]], 
+                  bottom = xlab4, ncol = 2)
+
+jpeg(filename = file.path(metRSfolder, "Scatterplot_topAdaLASSO_metabs_mald.jpg"), 
+     width = 9, height = 11, res = 300, units = "in")
+grid.arrange(g1, g2, g3, g4,
+             left = ylab, 
+             ncol = 1)
+dev.off()
+```

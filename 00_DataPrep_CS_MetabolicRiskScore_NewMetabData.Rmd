@@ -1,0 +1,563 @@
+---
+title: "00_DataPrep_CS_MetRS"
+author: "Suneeta Godbole"
+date: "01/21/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+
+library(openxlsx)
+library(data.table)
+library(stringr)
+
+### SPIROMICS
+infolder <- "C:/NetCo/Spiromics/CORE 6.1_Longitudinal_191118"
+metabfolder <- "C:/NetCo/Metabolomics/NewMetabolonDatasets_20211018/processed"
+clinfolder <- "C:/NetCo/Spiromics/CORE6.4_Clinical_20210105"
+spiro_v5 <- "C:/NetCo/Spiromics/V5_CORE 3.0_Clinical_20210309"
+outfolder <- "C:/NetCo/DiseaseProgression_Analysis"
+modulefolder <- "C:/NetCo/DiseaseProgression_Analysis/consensus (1)"
+metRSfolder <- "C:/NetCo/Metabolomic_Risk_Score"
+
+### COPDGene
+copd.infolder <- "C:/NetCo/Metabolomics"
+copd.clinical.folder <- "C:/NetCo/COPDGene/suni_new_clinical/suni_new_clinical"
+
+### Output
+analytic.outfolder <- "C:/NetCo/Metabolomic_Risk_Score/metRS_CS_AnalyticFiles"
+```
+
+## Goal: Create a cross-sectional LASSO/Elastic Net Model of Metabolites that explains Lung Function Outcomes
+Create clinical file with cross-sectional data and change variables for application of CS-elnet to delta variables
+
+### SPIROMICS
+```{r dataInSpiro}
+spiro.metab <- readRDS(file.path(metabfolder,
+                              "SPIROMICS_V1_LT20missing_knnImpute_metabolites_20211021.rds"))
+metab.ids <- rownames(spiro.metab)
+
+spiro.l <- read.csv(file.path(infolder, "CORE6_1_Longitudinal_191118.csv"), header = T, 
+                    stringsAsFactors = F)
+
+var.names <- names(spiro.l)
+
+#### -- V5
+# Get V5 data for Spiro
+spiro.v5 <- read.csv(file.path(spiro_v5, "V5_CORE3_CLINICAL_210308.csv"), header = T, 
+                     stringsAsFactors = F)
+#Reduce to used variables
+spiro.v5 <- spiro.v5[, c("SUBJID", "DATE_V5", "PCT_POST_FEV1_V5", "POST_FEV1_V5",
+                         "POST_FEV1FVC_DERV_V5", "COPDSCORE_V5", "SGR_TOTALSCORE_V5_A")]
+
+## -- POST_FEV1_V5 is equal to POST_FEV1_DERV -- Confirmed
+names(spiro.v5) <- c("SUBJID", "DATE_VISIT", "PCT_POST_FEV1", "POST_FEV1_DERV", 
+                     "POST_FEV1FVC_DERV", "COPDSCORE", "SGR_TOTALSCORE")
+spiro.v5$VISIT <- "VISIT_5"
+spiro.v5$POST_FEV1_ANNUALIZED_RATE <- NA
+spiro.v5$DATE_VISIT <- as.character(strptime(spiro.v5$DATE_VISIT, format = "%m/%d/%y"))
+### -- Add OBS_FEV1 V5 variable
+
+spiro.obsFEV1 <- read.csv("C:/NetCo/Spiromics/V5_INV 2.0_20201012/csv_files/V5_SDF_INV2_201012.csv", 
+                          header = T, stringsAsFactors = F)
+spiro.obsFEV1 <- spiro.obsFEV1[, c("SUBJID", "SDF5C")]
+names(spiro.obsFEV1)[names(spiro.obsFEV1) == "SDF5C"] <- "OBS_FEV1"
+
+spiro.v5 <- merge(spiro.v5, spiro.obsFEV1, by = "SUBJID", all.x = T)
+
+#Filter to metab ids
+spiro.l <- spiro.l[spiro.l$SUBJID %in% metab.ids, c("SUBJID", "VISIT", "DATE_VISIT", "PCT_POST_FEV1",
+                                                    "OBS_FEV1", "POST_FEV1FVC_DERV", 
+                                                    "POST_FEV1_ANNUALIZED_RATE", "POST_FEV1_DERV",
+                                                    "COPDSCORE", "SGR_TOTALSCORE")]
+spiro.v5 <- spiro.v5[spiro.v5$SUBJID %in% metab.ids, ]
+
+spiro.l <- rbind(spiro.l, spiro.v5)
+
+# length(unique(spiro.l$SUBJID)) ## Check number of pt
+
+### Add in Gender and Race vars from clinical file.
+spiro.c <- read.csv(file.path(clinfolder, "Core6_4_clinical_20210105.csv"), header = T, 
+                              stringsAsFactors = F)
+
+spiro.c <- spiro.c[spiro.c$SUBJID %in% metab.ids, c("SUBJID", "SITE", "STRATUM_GOLD",  "GENDER", "RACE",
+                                                    "ETHNICITY", "HT_CM_V1",
+                                                    "DEM02_V1", "DEM03_V1", "DEM04_V1", 
+                                                    "EMPHYSEMA_V1", "AGE_DERV_V1",
+                                                    "BMI_CM_V1", "COPDSCORE_V1", "CURRENT_SMOKER_V1", 
+                                                    "EMPHYSEMA_DIAGNOSED_V1", "SMOKING_PACK_YEARS_V1",
+                                                    "LOG950_VIDA_V1",
+                                                    "PRM_PERCENT_EMPHYSEM_TOTAL_V1", "DIABETES_DERV_V1", 
+                                                    "CHRONIC_BRONCHITIS_V1", "CBC_BASOPHIL_CNT_V1",
+                                                    "CBC_EOSINOPHIL_CNT_V1", "CBC_LYMPHOCYTE_CNT_V1",
+                                                    "CBC_MONOCYTE_CNT_V1", "CBC_NEUTROPHIL_CNT_V1",
+                                                    "COPDSCORE_V1", "PCT_POST_FEV1_ARC",
+                                                    "PCT_POST_FEV1_V1", "POST_FEV1FVC_DERV_ARC",
+                                                    "POST_FEV1FVC_DERV_V1", "POST_FEV1_DERV_ARC",
+                                                    "POST_FEV1_DERV_V1", "SGR_TOTALSCORE_V1_A",
+                                                    "SIX_MINUTE_WALK_DISTANCE_V1_A")]
+
+spiro.c$STRATUM_GOLD <- factor(spiro.c$STRATUM_GOLD, 
+                                levels = c(1,2,3,4), 
+                                labels = c("Non-smokers", 
+                                           "Post FEV1/FVC >= 0.7 (smokers, no COPD)", 
+                                           "Mild to Moderate", 
+                                           "Severe to Very Severe"))
+spiro.c$SITE_cat <- spiro.c$SITE
+spiro.c$SITE_cat[spiro.c$SITE %in% c("IA", "NJ", "TE", "UA", "UI")] <- "Oth"
+
+spiro.c$SITE_cat <- factor(spiro.c$SITE_cat,
+                           levels = c("CU", "JH", "LA", "MU", "SF", "UT", "WF", "Oth"), 
+                       labels = c("Columbia", 
+                                  "Johns Hopkins", 
+                                  "UCLA", 
+                                  "U of Michigan", 
+                                  "UCSF", 
+                                  "U of Utah", 
+                                  "Wake Forest University", 
+                                  "Other"))
+
+
+
+spiro.c$SITE <- factor(spiro.c$SITE, 
+                       levels = c("CU", "IA", "JH", "LA", "MU", "NJ", "SF", "TE", 
+                                  "UA", "UI", "UT", "WF"), 
+                       labels = c("Columbia", 
+                                  "U of Iowa", 
+                                  "Johns Hopkins", 
+                                  "UCLA", 
+                                  "U of Michigan", 
+                                  "National Jewish Health", 
+                                  "UCSF", 
+                                  "Temple U", 
+                                  "U of Alabama", 
+                                  "U of Illinois", 
+                                  "U of Utah", 
+                                  "Wake Forest University"))
+
+spiro.c$CURRENT_SMOKER_V1 <- factor(spiro.c$CURRENT_SMOKER_V1, 
+                                     levels = c(0, 1), 
+                                     labels = c("Not Current Smoker", 
+                                                "Current Smoker"))
+
+spiro.c$GENDER <- factor(spiro.c$GENDER, 
+                          levels = c(1,2), 
+                          labels = c("Male", "Female"))
+
+spiro.c$ETHNICITY <- factor(spiro.c$ETHNICITY, 
+                             levels = c(0,1), 
+                             labels = c("Not Hispanic or Latino", 
+                                        "Hispanic or Latino"))
+spiro.c$RACE <- factor(spiro.c$RACE, 
+                        levels = c(1:7), 
+                        labels = c("Caucasian/White", "Black or African American", 
+                                   "Asian", "American Indian or Alaska Native", 
+                                   "Native Hawaiin or Other Pacific Islander", 
+                                   "Mixed", "Missing"))
+
+spiro.c$DIABETES_DERV_V1 <- factor(spiro.c$DIABETES_DERV_V1, 
+                                    levels = c(0, 1), 
+                                    labels = c("No", "Yes"))
+
+
+spiro.c$smokStatus <- NA
+spiro.c$smokStatus[spiro.c$STRATUM_GOLD == "Non-smokers" & 
+                     spiro.c$CURRENT_SMOKER_V1 == "Not Current Smoker"] <- 0
+spiro.c$smokStatus[spiro.c$STRATUM_GOLD != "Non-smokers" & 
+                     spiro.c$CURRENT_SMOKER_V1 == "Not Current Smoker"] <- 1
+spiro.c$smokStatus[spiro.c$STRATUM_GOLD != "Non-smokers" & 
+                     spiro.c$CURRENT_SMOKER_V1 == "Current Smoker"] <- 2
+spiro.c$smokStatus <- factor(spiro.c$smokStatus, 
+                             levels = c(0,1,2), 
+                             labels = c("Never Smoked", "Former Smoker", "Current Smoker"))
+
+## CT emphysema variable (Labaki - 07/15/2021)
+spiro.ct <- read.csv("C:/NetCo/Spiromics/core6_ct/CORE 6_CT_190903/Core6_CT_190903.csv", 
+                     header = T, stringsAsFactors = F)
+spiro.ct <- spiro.ct[, c("SUBJID", "TLC_PERCENT_EMPHYSEMA_V1", "MODEL_V1")]
+
+spiro.c <- merge(spiro.c, spiro.ct, by = "SUBJID", all.x = T)
+
+## CT PD15 variable (Bowler/Labaki 9/15/2021) Data from Katherine 
+spiro.ct2 <- read.csv("C:/NetCo/Spiromics/V1_CT_TLC_INV15_190305 (1).csv", 
+                      header = T, stringsAsFactors = F)
+spiro.ct2 <- spiro.ct2[, c("SUBJID", "BOTH_TOT_V", "BOTH_HU15")]
+
+spiro.c <- merge(spiro.c, spiro.ct2, by = "SUBJID", all.x = T)
+
+#Create mesa adjusted lung density
+spiro.c$mesa_sex <- ifelse(spiro.c$GENDER == "Male", 2,
+                           ifelse(spiro.c$GENDER == "Female", 1, NA))
+
+spiro.c$mesa_low_bmi <- ifelse(spiro.c$BMI_CM_V1 < 20, 2, 1)
+spiro.c$mesa_low_bmi[is.na(spiro.c$BMI_CM_V1)] <- NA
+
+spiro.c$mesa_high_bmi <- ifelse(spiro.c$BMI_CM_V1 > 30, 2, 1)
+spiro.c$mesa_high_bmi[is.na(spiro.c$BMI_CM_V1)] <- NA
+
+for(i in 1:nrow(spiro.c)){
+  if (spiro.c$ETHNICITY[i] == "Hispanic or Latino"){
+    spiro.c$mesa_hispanic[i] = 2
+    spiro.c$mesa_black[i] = 1
+    spiro.c$mesa_chinese[i] = 1
+  }
+  
+  if (spiro.c$ETHNICITY[i] == "Not Hispanic or Latino" | is.na(spiro.c$ETHNICITY[i])){
+    spiro.c$mesa_hispanic[i] = 1
+    spiro.c$mesa_black[i] <- ifelse(spiro.c$RACE[i] == "Black or African American", 2, 1)
+    spiro.c$mesa_chinese[i] <-ifelse(spiro.c$RACE[i] == "Asian", 2, 1) 
+    }
+}
+
+spiro.c$TLV_pred_MESA <- (exp(7.939))*(spiro.c$AGE_DERV_V1**-0.145)*((spiro.c$HT_CM_V1/100)**2.285)*(spiro.c$mesa_sex**0.180)*(spiro.c$mesa_black**-0.241)*(spiro.c$mesa_hispanic**-0.157)*(spiro.c$mesa_chinese**-0.233)*(spiro.c$mesa_low_bmi**0.069)*(spiro.c$mesa_high_bmi**-0.086)
+
+spiro.c$Density <- spiro.c$BOTH_HU15+1000
+
+for(i in 1:nrow(spiro.c)){
+  if(spiro.c$Density[i] > 0 & spiro.c$Density[i] <= 1000 & !(is.na(spiro.c$Density[i]))){
+    spiro.c$adj_perc15[i] <- spiro.c$Density[i]*(spiro.c$BOTH_TOT_V[i]/spiro.c$TLV_pred_MESA[i])
+  }
+}
+
+rownames(spiro.c) <- spiro.c$SUBJID
+spiro.c <- spiro.c[order(rownames(spiro.c)), ]
+
+spiro.c$MODEL_V1_cat <- spiro.c$MODEL_V1
+spiro.c$MODEL_V1_cat[spiro.c$MODEL_V1_cat %in% c("", "Definition", "Sensation 64", "Definition AS+")] <- "Other"
+```
+
+### SPIROMICS Metabolites
+Establish names for the metabolites
+```{r metab_names}
+var.key <- readRDS(file.path(metabfolder, "SPIROMICS_V1_MetaboliteInformation_20211021.rds"))
+
+spiro.metab.pa <- readRDS(file.path(metabfolder,
+                                    "SPIROMICS_V1_2080missing_metabolites_20211021.rds"))
+
+cont.metabs <- names(spiro.metab)
+cat.metabs <- names(spiro.metab.pa)
+```
+
+### Metabolite matching between COPDGene and SPIROMICS
+```{r matchedMetabs}
+## Subset to metabolites in both COPDGene and SPIROMICS
+match.metab <- readRDS(file.path(metabfolder, "MatchedMetabolites.rds"))
+
+match.metab <- match.metab[match.metab$matched.metab == 1, ] ## Select only metabs that match in type across studies
+
+cont.matched.metab <- match.metab$metab_id[match.metab$copdg_imputation == "KNN"]
+cat.matched.metab <- match.metab$metab_id[match.metab$copdg_imputation == "Present/Absent"]
+
+spiro.metab.matched <- spiro.metab[, cont.matched.metab]
+spiro.metab.pa.matched <- spiro.metab.pa[, cat.matched.metab]
+
+met_log <- log(spiro.metab.matched) #log-transform continuous metabolites
+
+met_all <- as.matrix(cbind(met_log, spiro.metab.pa.matched))
+
+cormat <-  cor(met_all, method = "pearson") - diag(rep(1, ncol(met_all)))
+#table(cormat > 0.8) 
+#sum(abs(cormat) > 0.8)/2 ### 342 metabolites with correlations > 0.8
+
+met_all <- met_all[order(rownames(met_all)), ]
+met_all <- as.data.frame(met_all)
+
+spiro.metab.matched <- spiro.metab.matched[order(rownames(spiro.metab.matched)), ]
+spiro.metab.pa.matched <- spiro.metab.pa.matched[order(rownames(spiro.metab.pa.matched)), ]
+```
+
+### COPDGene Data
+```{r readIn}
+met2_no_out <- readRDS(file.path(metabfolder, "COPDGene_P2_LT20miss_knnImp_NoOut_metabs_20211021.rds"))
+metab.info <- readRDS(file.path(metabfolder, "COPDGene_P2_MetaboliteInformation_20211021.rds"))
+metabo.pa <- readRDS(file.path(metabfolder, "COPDGene_P2_2080miss_NoOut_metabs_20211021.rds"))
+subid.keep <- rownames(met2_no_out)
+```
+
+
+### COPDGene Metabolites with < 20% -- log transform
+```{r miss_lt20}
+met_log <- log(met2_no_out)
+
+sum(rownames(met_log) == rownames(metabo.pa))
+
+met_copd <- cbind(met_log, metabo.pa)
+met_copd <- as.data.frame(met_copd)
+met_copd$sid <- rownames(met_copd)
+
+metRS_copd <- met_copd
+metRS_copd$sid <- NULL
+metRS_copd <- metRS_copd[, c(colnames(met_all))]
+```
+
+### COPDGene Clinical data
+```{r clin}
+copd.clin <- read.csv(file.path(copd.clinical.folder, "COPDGene_P1P2P3_SM_NS_Long_Mar20.csv"), 
+                      header = T, stringsAsFactors = F)
+names(copd.clin)[names(copd.clin) == "ï..sid"] <- "sid"
+
+copd.ids.P1 <- copd.clin$sid[copd.clin$visitnum == 1]
+copd.ids.P2 <- copd.clin$sid[copd.clin$visitnum == 2]
+copd.ids.P3 <- copd.clin$sid[copd.clin$visitnum == 3]
+
+copd.clin <- copd.clin[copd.clin$sid %in% subid.keep, ] ## subset to pt with metabolite data
+
+length(unique(copd.clin$sid)) ## 1125 subjects
+
+copd.clin.p2 <- copd.clin[copd.clin$visitnum == 2, ]
+
+## Check for variables in data set
+sum(names(copd.clin.p2) %in% c("pctEmph_Thirona", "PRM_pct_emphysema_Thirona", "perc15_density", 
+                               "scannerId", "Diabetes"))
+```
+
+Descriptives for COPD Gene P2 visit
+```{r describeP2}
+copd.clin.p2$finalgold_visit <- factor(copd.clin.p2$finalgold_visit, 
+                                levels = c(-2, -1, 0, 1,2,3,4), 
+                                labels = c("Never-smoked Normal",
+                                           "PRISm (FEV1/FVC >= 0.7 but FEV1 < 80%)", 
+                                           "GOLD 0 Control (FEV1 >= 80%, FEV1/FVC >= 0.7)", 
+                                           "GOLD 1 (FEV1 >= 80%, FEV1/FVC < 0.7)", 
+                                           "GOLD 2 (50% <= FEV1 < 80%, FEV1/FVC < 0.7)", 
+                                           "GOLD 3 (30% <= FEV1 < 50%, FEV1/FVC < 0.7)", 
+                                           "GOLD 4 (FEV1 < 30%, FEV1/FVC < 0.7)"))
+
+copd.clin.p2$smoking_status <- factor(copd.clin.p2$smoking_status, 
+                                     levels = c(0, 1, 2), 
+                                     labels = c("Never Smoked", 
+                                                "Former Smoker", 
+                                                "Current Smoker"))
+
+copd.clin.p2$Income <- factor(copd.clin.p2$Income,
+                            levels = c(1:6), 
+                            labels = c("< $15k", "$15k-$35k", "$35k-$50k", "$50k-$75k", "$75k or more",
+                                       "Declines to answer"))
+
+
+
+copd.clin.p2$EmphDxByDr <- factor(copd.clin.p2$EmphDxByDr, 
+                                          levels = c(0,1), 
+                                          labels = c("No", "Yes"))
+
+copd.clin.p2$gender <- factor(copd.clin.p2$gender, 
+                          levels = c(1,2), 
+                          labels = c("Male", "Female"))
+
+copd.clin.p2$ethnic <- factor(copd.clin.p2$ethnic, 
+                             levels = c(1, 2), 
+                             labels = c("Hispanic or Latino", 
+                                        "Not Hispanic or Latino"))
+
+copd.clin.p2$race <- factor(copd.clin.p2$race, 
+                        levels = c(1:7), 
+                        labels = c("Caucasian/White", "Black or African American", 
+                                   "Asian", "Pacific Islander", "American Indian or Alaska Native", 
+                                   "> 1 race", 
+                                   "Other"))
+copd.clin.p2$Diabetes <- factor(copd.clin.p2$Diabetes, 
+                                levels = c(0, 1), 
+                                labels = c("No", "Yes"))
+
+#Relabel output variables from COPDGene to include indicator of phase
+names(copd.clin.p2)[names(copd.clin.p2) == "FEV1_post"] <- "FEV1_post.2"
+names(copd.clin.p2)[names(copd.clin.p2) == "FEV1_FVC_post"] <- "FEV1_FVC_post.2"
+names(copd.clin.p2)[names(copd.clin.p2) == "pctEmph_Thirona"] <- "pctEmph_Thirona.2"
+names(copd.clin.p2)[names(copd.clin.p2) == "PRM_pct_emphysema_Thirona"] <- "PRM_pct_emphysema_Thirona.2"
+names(copd.clin.p2)[names(copd.clin.p2) == "FEV1pp_post"] <- "FEV1pp_post.2"
+```
+
+## Table 1
+```{r tab1, eval=F}
+spiro.c$RACE.ETH <- 3
+spiro.c$RACE.ETH[spiro.c$ETHNICITY == "Not Hispanic or Latino" & spiro.c$RACE == "Caucasian/White"] <- 1
+spiro.c$RACE.ETH[spiro.c$RACE == "Black or African American"] <- 2
+spiro.c$RACE.ETH <- factor(spiro.c$RACE.ETH, 
+                           levels = c(1,2,3), 
+                           labels = c("Non-Hispanic, White", "Black/Africian American", 
+                                      "Other"))
+
+copd.clin.p2$race.eth <- 3
+copd.clin.p2$race.eth[copd.clin.p2$race == "Caucasian/White"] <- 1
+copd.clin.p2$race.eth[copd.clin.p2$race == "Black or African American"] <- 2
+
+copd.clin.p2$race.eth <- factor(copd.clin.p2$race.eth, 
+                                levels = c(1,2,3), 
+                                labels = c("Non-Hispanic, White", "Black/Africian American", 
+                                      "Other"))
+
+spiro.c$tab1_gold <- NA
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 < 80.0 & spiro.c$POST_FEV1FVC_DERV_V1 >= 0.70] <- -1
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 >= 80.0 & spiro.c$POST_FEV1FVC_DERV_V1 >= 0.70] <- 0
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 >= 80.0 & spiro.c$POST_FEV1FVC_DERV_V1 < 0.70] <- 1
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 >= 50.0 & spiro.c$PCT_POST_FEV1_V1 < 80.0 
+                  & spiro.c$POST_FEV1FVC_DERV_V1 < 0.70] <- 2
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 >= 30.0 & spiro.c$PCT_POST_FEV1_V1 < 50.0 
+                  & spiro.c$POST_FEV1FVC_DERV_V1 < 0.70] <- 3
+spiro.c$tab1_gold[spiro.c$PCT_POST_FEV1_V1 < 30.0 
+                  & spiro.c$POST_FEV1FVC_DERV_V1 < 0.70] <- 4
+spiro.c$tab1_gold[is.na(spiro.c$PCT_POST_FEV1_V1) | is.na(spiro.c$POST_FEV1FVC_DERV_V1)] <- NA
+
+spiro.c$tab1_gold <- factor(spiro.c$tab1_gold, 
+                            levels = c(-1, 0,1,2,3,4), 
+                            labels = c("PRISm", 
+                                       "COPD 0", 
+                                       "COPD 1", 
+                                       "COPD 2", 
+                                       "COPD 3", 
+                                       "COPD 4"))
+
+copd.clin.p2$tab1_gold <- NA
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 < 80.0 & copd.clin.p2$FEV1_FVC_post.2 >= 0.70] <- -1
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 >= 80.0 & copd.clin.p2$FEV1_FVC_post.2 >= 0.70] <- 0
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 >= 80.0 & copd.clin.p2$FEV1_FVC_post.2 < 0.70] <- 1
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 >= 50.0 & copd.clin.p2$FEV1pp_post.2 < 80.0 
+                  & copd.clin.p2$FEV1_FVC_post.2 < 0.70] <- 2
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 >= 30.0 & copd.clin.p2$FEV1pp_post.2 < 50.0 
+                  & copd.clin.p2$FEV1_FVC_post.2 < 0.70] <- 3
+copd.clin.p2$tab1_gold[copd.clin.p2$FEV1pp_post.2 < 30.0 
+                  & copd.clin.p2$FEV1_FVC_post.2 < 0.70] <- 4
+copd.clin.p2$tab1_gold[is.na(copd.clin.p2$FEV1pp_post.2) | is.na(copd.clin.p2$FEV1_FVC_post.2)] <- NA
+
+copd.clin.p2$tab1_gold <- factor(copd.clin.p2$tab1_gold, 
+                            levels = c(-1, 0,1,2,3,4), 
+                            labels = c("PRISm", 
+                                       "COPD 0", 
+                                       "COPD 1", 
+                                       "COPD 2", 
+                                       "COPD 3", 
+                                       "COPD 4"))
+
+spiro.tab1 <- spiro.c[, c("SUBJID", "AGE_DERV_V1", "BMI_CM_V1", "SMOKING_PACK_YEARS_V1",
+                          "POST_FEV1_DERV_V1", "POST_FEV1FVC_DERV_V1", 
+                          "TLC_PERCENT_EMPHYSEMA_V1", "PRM_PERCENT_EMPHYSEM_TOTAL_V1", 
+                          "GENDER", "RACE.ETH", "tab1_gold", "smokStatus", "SITE_cat", "adj_perc15",
+                          "PCT_POST_FEV1_V1")]
+names(spiro.tab1) <- c("sid", "age", "bmi", "smokingPackYrs",
+                          "fev1_post", "fev1fvc_post", 
+                          "pctEmph", "PRM_pctEmph", 
+                          "gender", "race.eth", "tab1_gold", "smokingStatus", "site", "MESA_adjPD15", 
+                       "FEV1pp_post.2")
+spiro.tab1$Study <- "SPIROMICS"
+
+copdg.tab1 <- copd.clin.p2[, c("sid", "age_visit", "BMI", "ATS_PackYears", 
+                               "FEV1_post.2", "FEV1_FVC_post.2", "pctEmph_Thirona.2",
+                               "PRM_pct_emphysema_Thirona.2", "gender", 
+                               "race.eth", "tab1_gold", "smoking_status", "ccenter", "adj_density_mesa", 
+                               "FEV1pp_post.2")]
+names(copdg.tab1) <- c("sid", "age", "bmi", "smokingPackYrs",
+                          "fev1_post", "fev1fvc_post", 
+                          "pctEmph", "PRM_pctEmph", 
+                          "gender", "race.eth", "tab1_gold", "smokingStatus", "site", "MESA_adjPD15", 
+                       "FEV1pp_post.2")
+copdg.tab1$Study <- "COPDGene"
+
+tab1.df <- rbind(spiro.tab1, copdg.tab1)
+
+mean.sd <- function(x, data) {
+  y <- c(sum(!(is.na(data[, x]))), round(mean(data[, x], na.rm = T), 3), 
+         round(sd(data[, x], na.rm= T), 2))
+  return(y)
+}
+
+summaries <- data.frame(n=double(0),mean=double(0), sd=double(0), varCat = character(), 
+                        stringsAsFactors = F) 
+
+varInt <- c("age", "bmi", "smokingPackYrs", "fev1_post", "fev1fvc_post", 
+            "pctEmph", "PRM_pctEmph", "MESA_adjPD15", "FEV1pp_post.2")
+
+cat.unique <- unique(tab1.df$Study)
+
+for(j in cat.unique){
+  for(i in 1:length(varInt)){
+    summaries <- rbind(summaries, c(mean.sd(varInt[i], 
+                                            data = tab1.df[tab1.df$Study ==j, ]),
+                                    j))
+  }
+}
+
+names(summaries) <- c("n", "mean", "sd", "Study")
+
+summaries <- cbind(varInt, summaries)
+
+summaries.w <- reshape(summaries, 
+                       timevar = "Study", 
+                       idvar = "varInt", 
+                       direction = "wide")
+
+for(i in 1:length(varInt)){
+  summaries.w$p.val[i] <- summary(aov(as.formula(paste0(varInt[i], "~ Study")),
+                                      data = tab1.df))[[1]][1, 5]
+  
+}
+
+table.deconstruct <- function(x, y, data){
+  tab <- as.data.frame(table(data[, x], data[, y]))
+  tab$prop <- round(as.numeric(prop.table(table(data[, x], 
+                                                data[, y]), 
+                                          margin= 2)), 3)*100
+  
+  if(all(tab$Freq >0) == T){
+    tab$chisq.p <- chisq.test(data[, x], data[, y])$p.value
+  }
+  else(tab$chisq.p <- fisher.test(data[, x], data[, y])$p.value)
+
+  tab$var1.name <- x
+  tab$var2.name <- y
+  
+  return(tab)
+}
+
+cat.table <- data.frame(Var1 = character(),
+                        Var2 = character(),
+                        Freq = numeric(),
+                        prop = numeric(),
+                        stringsAsFactors = F)
+
+varInt2 <- c("gender", "race.eth", "tab1_gold", "smokingStatus")
+
+for(i in 1:length(varInt2)){
+  res <- table.deconstruct(varInt2[i], "Study", tab1.df)
+  cat.table <- rbind(cat.table, res)
+}
+
+cat.tab.w <- reshape(cat.table, 
+                     timevar = "Var2", 
+                     idvar = c("Var1", "var1.name", "var2.name"), 
+                     direction = "wide")
+
+names(summaries.w) <- c("var1.name", "n.spiro", "est.spiro", "sd.spiro", 
+                        "n.copdg", "est.copdg", "sd.copdg", "p.val")
+summaries.w$cats <- ""
+names(cat.tab.w) <- c("cats", "var1.name", "var2.names", "est.copdg", "sd.copdg", 
+                      "chi.copdg", "est.spiro", "sd.spiro", "p.val")
+
+
+tab1 <- rbind(summaries.w[, c("var1.name", "cats", "est.spiro", "sd.spiro", 
+                              "est.copdg", "sd.copdg", "p.val")], 
+              cat.tab.w[, c("var1.name", "cats", "est.spiro", "sd.spiro", 
+                              "est.copdg", "sd.copdg", "p.val")])
+rownames(tab1) <- NULL
+
+tab1$p.string <- ifelse(tab1$p.val >= 0.05, " ", 
+                        ifelse(tab1$p.val < 0.001, "***",
+                               ifelse(tab1$p.val < 0.01, "**", "*")))
+
+tab1$spiro <- paste0(tab1$est.spiro, " (", tab1$sd.spiro, ")")
+tab1$copdg <- paste0(tab1$est.copdg, " (", tab1$sd.copdg, ")")
+
+# write.csv(tab1[, c("var1.name", "cats", "spiro", "copdg", "p.val", "p.string")], 
+#           file = file.path(metRSfolder, "metRS_Table1_20210928.csv"), 
+#           row.names = F)
+```
+
+## Save clinical data set
+```{r saveDatasets}
+saveRDS(spiro.c, file.path(analytic.outfolder, "SPIROMICS_MetRS_CS_Clinical.rds"))
+saveRDS(met_all, file.path(analytic.outfolder, "SPIROMICS_MetRS_CS_Metabolites.rds"))
+
+saveRDS(copd.clin.p2, file.path(analytic.outfolder, "COPDGene_P2_MetRS_CS_Clinical.rds"))
+saveRDS(metRS_copd, file.path(analytic.outfolder, "COPDGene_P2_MetRS_CS_Metabolites.rds"))
+```
